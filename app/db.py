@@ -23,6 +23,8 @@
   ``ALTER TABLE ... DEFAULT`` 补齐，旧实验一律按 active / 版本 0 处理。
 * ``experiment_state_events``：暂停 / 恢复的追加式审计记录，
   按 ``(实验, operation_id)`` 唯一约束支持操作幂等重放，查询按时间倒序。
+* ``state_batches``：批量暂停 / 恢复的幂等结果，按全局
+  ``batch_operation_id`` 去重，保存首次请求绑定的有序条目与首次状态事件。
 """
 
 from __future__ import annotations
@@ -129,6 +131,15 @@ CREATE TABLE IF NOT EXISTS experiment_state_events (
     created_at     TEXT NOT NULL,
     UNIQUE (experiment_id, operation_id)
 );
+
+CREATE TABLE IF NOT EXISTS state_batches (
+    batch_operation_id TEXT PRIMARY KEY,   -- 全局批量幂等键（跨实验，不绑定单一实验）
+    items              TEXT NOT NULL,      -- JSON：首次请求绑定的有序条目
+                                           -- [{experiment_id, action,
+                                           --   expected_version, operation_id, reason}]
+    results            TEXT NOT NULL,      -- JSON：首次结果（按输入顺序的状态事件）
+    created_at         TEXT NOT NULL
+);
 """
 
 
@@ -231,6 +242,23 @@ class InvalidStateTransitionError(Exception):
             f"invalid state transition: {reason}, status={current_status}, "
             f"version={state_version}"
         )
+
+
+class StateBatchConflictError(Exception):
+    """batch_operation_id 已被条目列表不同的另一次批量状态切换占用。"""
+
+
+class StateBatchItemsRejectedError(Exception):
+    """批量状态切换中至少一个条目未通过校验，整批必须零写入。
+
+    :param failures: 每个失败条目一项，含 ``index`` / ``experiment_id`` /
+        ``reason``，并按原因附带 ``current_status`` / ``state_version`` /
+        ``expected_version``；不含任何揭盲信息。
+    """
+
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
+        self.failures = failures
+        super().__init__(f"state batch items rejected: {len(failures)} failure(s)")
 
 
 def utc_now() -> datetime:
@@ -1165,6 +1193,271 @@ def _resume_locked(
         (cursor.lastrowid,),
     ).fetchone()
     return _event_payload(inserted, False)
+
+
+def state_batch(
+    batch_operation_id: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """在单个写事务内批量暂停 / 恢复多个实验。
+
+    流程（全部在一个 ``BEGIN IMMEDIATE`` 事务内完成）：
+
+    1. 批量幂等检查：``batch_operation_id`` 已存在时，仅当本次条目列表
+       （``experiment_id`` / ``action`` / ``expected_version`` /
+       ``operation_id`` / ``reason`` 及顺序）与首次完全一致才返回首次结果；
+       任一条目不同则抛出 :class:`StateBatchConflictError`；
+    2. 统一校验：对每个条目做与单条暂停 / 恢复一致的检查——实验必须存在；
+       条目的 ``operation_id`` 若已绑定同实验的其他动作 / 期望版本 / 原因，
+       记为 ``operation_id_conflict``；否则当前 ``state_version`` 必须等于
+       ``expected_version``，再校验目标状态可达（暂停要求当前为 ``active``，
+       恢复要求当前为 ``paused``）。任一条目失败即汇总全部失败项并抛出
+       :class:`StateBatchItemsRejectedError`，**整批回滚、零写入**——
+       没有任何实验被切换、没有任何审计记录落盘；
+    3. 执行：仅当全部条目通过后，才按输入顺序更新每个实验的
+       ``status`` / ``state_version`` 并追加一条审计记录，最后落盘
+       ``state_batches`` 幂等结果，一起提交或一起回滚。
+
+    返回首次 / 重放的状态事件列表（按输入顺序）。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            result = _state_batch_locked(conn, batch_operation_id, items)
+            if not result["_replayed"]:
+                conn.execute("COMMIT")
+                committed = True
+            result.pop("_replayed", None)
+            return result
+        finally:
+            if not committed:
+                # 重放（只读）、409 或异常时结束事务
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def _bound_item(item: dict[str, Any]) -> dict[str, Any]:
+    """抽取参与幂等绑定比较的条目字段（含顺序无关，逐条比较）。"""
+    return {
+        "experiment_id": item["experiment_id"],
+        "action": item["action"],
+        "expected_version": item["expected_version"],
+        "operation_id": item["operation_id"],
+        "reason": item.get("reason"),
+    }
+
+
+def _state_batch_locked(
+    conn: sqlite3.Connection,
+    batch_operation_id: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    # 1) 批量幂等命中：条目列表（含顺序）一致才返回首次结果，否则 409
+    batch_row = conn.execute(
+        "SELECT items, results FROM state_batches "
+        "WHERE batch_operation_id = ?",
+        (batch_operation_id,),
+    ).fetchone()
+    if batch_row is not None:
+        bound_items = [
+            _bound_item(m) for m in json.loads(batch_row["items"])
+        ]
+        request_items = [_bound_item(m) for m in items]
+        if bound_items != request_items:
+            raise StateBatchConflictError()
+        return {
+            "batch_operation_id": batch_operation_id,
+            "results": json.loads(batch_row["results"]),
+            "_replayed": True,
+        }
+
+    # 2) 统一校验全部条目：实验存在性、operation_id 绑定、版本与目标状态
+    plan: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for index, item in enumerate(items):
+        experiment_id = item["experiment_id"]
+        action = item["action"]
+        expected_version = item["expected_version"]
+        operation_id = item["operation_id"]
+        reason = item.get("reason")
+
+        row = conn.execute(
+            "SELECT status, state_version FROM experiments WHERE id = ?",
+            (experiment_id,),
+        ).fetchone()
+        if row is None:
+            failures.append(
+                {
+                    "index": index,
+                    "experiment_id": experiment_id,
+                    "reason": "experiment_not_found",
+                }
+            )
+            continue
+
+        current_status = row["status"]
+        current_version = int(row["state_version"])
+
+        # operation_id 若已在该实验上落盘，必须与本次条目完全一致，
+        # 否则该条目冲突（与单条暂停 / 恢复共享同一审计幂等空间）
+        event_row = conn.execute(
+            "SELECT action, state_version, reason FROM experiment_state_events "
+            "WHERE experiment_id = ? AND operation_id = ?",
+            (experiment_id, operation_id),
+        ).fetchone()
+        if event_row is not None:
+            consistent = (
+                event_row["action"] == action
+                and event_row["reason"] == reason
+                and (
+                    action == "pause"
+                    or int(event_row["state_version"]) - 1 == expected_version
+                )
+            )
+            if not consistent:
+                failures.append(
+                    {
+                        "index": index,
+                        "experiment_id": experiment_id,
+                        "reason": "operation_id_conflict",
+                        "operation_id": operation_id,
+                        "current_status": current_status,
+                        "state_version": current_version,
+                    }
+                )
+                continue
+            # 已落盘且一致：作为重放事件，不再要求版本 / 状态匹配
+            plan.append(
+                {
+                    "index": index,
+                    "experiment_id": experiment_id,
+                    "replayed": True,
+                }
+            )
+            continue
+
+        # 版本门禁优先：期望版本与当前版本不符即冲突（不论动作）
+        if current_version != expected_version:
+            failures.append(
+                {
+                    "index": index,
+                    "experiment_id": experiment_id,
+                    "reason": "state_version_mismatch",
+                    "current_status": current_status,
+                    "state_version": current_version,
+                    "expected_version": expected_version,
+                }
+            )
+            continue
+
+        target = "paused" if action == "pause" else "active"
+        if current_status == target:
+            failures.append(
+                {
+                    "index": index,
+                    "experiment_id": experiment_id,
+                    "reason": (
+                        "already_paused" if action == "pause" else "already_active"
+                    ),
+                    "current_status": current_status,
+                    "state_version": current_version,
+                    "expected_version": expected_version,
+                }
+            )
+            continue
+
+        plan.append(
+            {
+                "index": index,
+                "experiment_id": experiment_id,
+                "action": action,
+                "reason": reason,
+                "operation_id": operation_id,
+                "from_status": current_status,
+                "new_version": current_version + 1,
+                "replayed": False,
+            }
+        )
+
+    if failures:
+        # 整批零写入：不切换任何实验、不追加任何审计，由外层事务回滚
+        raise StateBatchItemsRejectedError(failures)
+
+    # 3) 全部通过：按输入顺序执行状态切换并追加审计
+    created_at = utc_now().isoformat()
+    event_by_index: dict[int, dict[str, Any]] = {}
+
+    for step in plan:
+        index = step["index"]
+        experiment_id = step["experiment_id"]
+
+        if step["replayed"]:
+            event_row = conn.execute(
+                "SELECT * FROM experiment_state_events "
+                "WHERE experiment_id = ? AND operation_id = ?",
+                (experiment_id, items[index]["operation_id"]),
+            ).fetchone()
+            event_by_index[index] = _state_event_dict(event_row)
+            continue
+
+        action = step["action"]
+        new_version = step["new_version"]
+        conn.execute(
+            "UPDATE experiments SET status = ?, state_version = ? WHERE id = ?",
+            (
+                "paused" if action == "pause" else "active",
+                new_version,
+                experiment_id,
+            ),
+        )
+        cursor = conn.execute(
+            "INSERT INTO experiment_state_events "
+            "(experiment_id, operation_id, action, from_status, to_status, "
+            "state_version, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                experiment_id,
+                step["operation_id"],
+                action,
+                step["from_status"],
+                "paused" if action == "pause" else "active",
+                new_version,
+                step["reason"],
+                created_at,
+            ),
+        )
+        inserted = conn.execute(
+            "SELECT * FROM experiment_state_events WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        event_by_index[index] = _state_event_dict(inserted)
+
+    results = [event_by_index[index] for index in range(len(items))]
+
+    conn.execute(
+        "INSERT INTO state_batches "
+        "(batch_operation_id, items, results, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            batch_operation_id,
+            json.dumps(
+                [_bound_item(item) for item in items], ensure_ascii=False
+            ),
+            json.dumps(results, ensure_ascii=False),
+            created_at,
+        ),
+    )
+
+    return {
+        "batch_operation_id": batch_operation_id,
+        "results": results,
+        "_replayed": False,
+    }
 
 
 def list_state_events(

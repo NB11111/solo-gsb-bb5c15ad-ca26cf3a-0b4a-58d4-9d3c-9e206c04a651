@@ -2075,3 +2075,873 @@ def test_legacy_database_defaults_to_active_version_zero(
             "/experiments/legacy-pause/advance",
             json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
         ).status_code == 200
+
+
+# ---------- 批量状态切换（pause / resume） ----------
+
+def state_batch(client: TestClient, batch_operation_id: str, items: list[dict]):
+    return client.post(
+        "/experiments/state-batch",
+        json={"batch_operation_id": batch_operation_id, "items": items},
+    )
+
+
+def test_state_batch_pauses_multiple_experiments_in_one_request(
+    client: TestClient,
+) -> None:
+    first, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    second, _ = create_experiment(
+        client, conditions=["A", "B", "C"],
+        subject_ids=[f"t{i}" for i in range(6)], seed=2,
+    )
+    eid1, eid2 = first["experiment_id"], second["experiment_id"]
+
+    resp = state_batch(
+        client,
+        "batch-pause-1",
+        [
+            {
+                "experiment_id": eid1,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-p1",
+                "reason": "hold one",
+            },
+            {
+                "experiment_id": eid2,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-p2",
+                "reason": "hold two",
+            },
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["batch_operation_id"] == "batch-pause-1"
+    results = body["results"]
+    assert [r["experiment_id"] for r in results] == [eid1, eid2]
+    assert [r["action"] for r in results] == ["pause", "pause"]
+    assert [r["state_version"] for r in results] == [1, 1]
+    assert results[0]["reason"] == "hold one"
+    assert results[1]["reason"] == "hold two"
+    assert all(r["to_status"] == "paused" for r in results)
+    assert all(r["from_status"] == "active" for r in results)
+
+    # 两个实验都被暂停、版本各自加一
+    for eid in (eid1, eid2):
+        detail = client.get(f"/experiments/{eid}").json()
+        assert detail["status"] == "paused"
+        assert detail["state_version"] == 1
+
+
+def test_state_batch_mixed_pause_and_resume(client: TestClient) -> None:
+    paused, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    active, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=2
+    )
+    eid_paused = paused["experiment_id"]
+    eid_active = active["experiment_id"]
+    assert pause_experiment(client, eid_paused, "pre-pause", "hold").status_code == 200
+
+    resp = state_batch(
+        client,
+        "batch-mix-1",
+        [
+            # 暂停一个运行中的实验
+            {
+                "experiment_id": eid_active,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-pause-active",
+                "reason": "freeze",
+            },
+            # 同时恢复一个已暂停（版本 1）的实验
+            {
+                "experiment_id": eid_paused,
+                "action": "resume",
+                "expected_version": 1,
+                "operation_id": "op-resume-held",
+                "reason": "release",
+            },
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert [(r["experiment_id"], r["action"], r["state_version"]) for r in results] == [
+        (eid_active, "pause", 1),
+        (eid_paused, "resume", 2),
+    ]
+    assert client.get(f"/experiments/{eid_active}").json()["status"] == "paused"
+    assert client.get(f"/experiments/{eid_paused}").json()["status"] == "active"
+
+
+def test_state_batch_validates_all_before_writing_and_rolls_back(
+    client: TestClient,
+) -> None:
+    ok_exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    paused_exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=2
+    )
+    another_paused, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["u1", "u2"], seed=3
+    )
+    eid_ok = ok_exp["experiment_id"]
+    eid_paused = paused_exp["experiment_id"]
+    eid_paused2 = another_paused["experiment_id"]
+    # 后两个实验已暂停于版本 1
+    assert pause_experiment(client, eid_paused, "op-held", "hold").status_code == 200
+    assert pause_experiment(client, eid_paused2, "op-held2", "hold").status_code == 200
+
+    resp = state_batch(
+        client,
+        "batch-conflict-1",
+        [
+            # 本可通过的暂停
+            {
+                "experiment_id": eid_ok,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-ok",
+                "reason": "should not happen",
+            },
+            # 版本过期 → 冲突
+            {
+                "experiment_id": eid_paused,
+                "action": "resume",
+                "expected_version": 0,
+                "operation_id": "op-stale",
+            },
+            # 已暂停的实验再暂停 → already_paused
+            {
+                "experiment_id": eid_paused2,
+                "action": "pause",
+                "expected_version": 1,
+                "operation_id": "op-again",
+                "reason": "again",
+            },
+            # 不存在的实验
+            {
+                "experiment_id": "ghost-exp",
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-ghost",
+                "reason": "nope",
+            },
+        ],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "state_batch_item_rejected"
+    assert detail["batch_operation_id"] == "batch-conflict-1"
+    failures = detail["failures"]
+    assert [f["index"] for f in failures] == [1, 2, 3]
+    by_index = {f["index"]: f for f in failures}
+    assert by_index[1]["experiment_id"] == eid_paused
+    assert by_index[1]["reason"] == "state_version_mismatch"
+    assert by_index[1]["state_version"] == 1
+    assert by_index[1]["expected_version"] == 0
+    assert by_index[1]["current_status"] == "paused"
+    assert by_index[2]["experiment_id"] == eid_paused2
+    assert by_index[2]["reason"] == "already_paused"
+    assert by_index[3]["reason"] == "experiment_not_found"
+    assert_no_sequence_leak(detail)
+
+    # 整批零写入：本可通过的第一个实验也未被暂停，且没有任何审计记录
+    detail_ok = client.get(f"/experiments/{eid_ok}").json()
+    assert detail_ok["status"] == "active"
+    assert detail_ok["state_version"] == 0
+    assert client.get(f"/experiments/{eid_ok}/state-events").json()["events"] == []
+    # 失败不消耗 batch_operation_id：修正条目后同键首次成功
+    fixed = state_batch(
+        client,
+        "batch-conflict-1",
+        [
+            {
+                "experiment_id": eid_ok,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-ok",
+                "reason": "now it happens",
+            }
+        ],
+    )
+    assert fixed.status_code == 200, fixed.text
+    assert fixed.json()["results"][0]["state_version"] == 1
+
+
+def test_state_batch_already_active_rejected_with_zero_writes(
+    client: TestClient,
+) -> None:
+    exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=3
+    )
+    eid = exp["experiment_id"]
+    resp = state_batch(
+        client,
+        "batch-already-active",
+        [
+            {
+                "experiment_id": eid,
+                "action": "resume",
+                "expected_version": 0,
+                "operation_id": "op-resume-active",
+            }
+        ],
+    )
+    assert resp.status_code == 409
+    failure = resp.json()["detail"]["failures"][0]
+    assert failure["reason"] == "already_active"
+    assert failure["current_status"] == "active"
+    assert failure["state_version"] == 0
+    assert client.get(f"/experiments/{eid}").json()["state_version"] == 0
+    assert client.get(f"/experiments/{eid}/state-events").json()["events"] == []
+
+
+def test_state_batch_idempotent_replays_first_result(client: TestClient) -> None:
+    first, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid1 = first["experiment_id"]
+    second, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=5
+    )
+    eid2 = second["experiment_id"]
+
+    items = [
+        {
+            "experiment_id": eid1,
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": "bp1",
+            "reason": "hold",
+        },
+        {
+            "experiment_id": eid2,
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": "bp2",
+            "reason": "hold",
+        },
+    ]
+    first_resp = state_batch(client, "batch-idem", items)
+    assert first_resp.status_code == 200
+    first_body = first_resp.json()
+
+    for _ in range(3):
+        replay = state_batch(client, "batch-idem", items)
+        assert replay.status_code == 200
+        assert replay.json() == first_body
+
+    # 重放不重复递增版本、不产生额外审计
+    for eid in (eid1, eid2):
+        assert client.get(f"/experiments/{eid}").json()["state_version"] == 1
+        events = client.get(f"/experiments/{eid}/state-events").json()["events"]
+        assert len(events) == 1
+
+    # 即使实验后续被恢复到更新版本，整批重放仍返回首次结果
+    assert resume_experiment(client, eid1, 1, "br1").status_code == 200
+    replay = state_batch(client, "batch-idem", items)
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+    assert client.get(f"/experiments/{eid1}").json()["state_version"] == 2
+
+
+def test_state_batch_same_id_different_items_returns_409(
+    client: TestClient,
+) -> None:
+    first, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    second, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=5
+    )
+    eid1 = first["experiment_id"]
+    eid2 = second["experiment_id"]
+
+    items = [
+        {
+            "experiment_id": eid1,
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": "bp1",
+            "reason": "hold",
+        }
+    ]
+    assert state_batch(client, "shared-batch-op", items).status_code == 200
+
+    # 不同条目集合
+    other = state_batch(
+        client,
+        "shared-batch-op",
+        [
+            {
+                "experiment_id": eid2,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "bp2",
+                "reason": "hold",
+            }
+        ],
+    )
+    assert other.status_code == 409
+    detail = other.json()["detail"]
+    assert detail["reason"] == "batch_operation_id_conflict"
+    assert detail["batch_operation_id"] == "shared-batch-op"
+
+    # 相同实验但期望版本不同
+    diff_version = state_batch(
+        client,
+        "shared-batch-op",
+        [
+            {
+                "experiment_id": eid1,
+                "action": "pause",
+                "expected_version": 1,
+                "operation_id": "bp1",
+                "reason": "hold",
+            }
+        ],
+    )
+    assert diff_version.status_code == 409
+    assert (
+        diff_version.json()["detail"]["reason"] == "batch_operation_id_conflict"
+    )
+
+    # 相同实验但动作不同（eid1 已被首批暂停于版本 1：版本匹配但目标已是 active 的反面）
+    diff_action = state_batch(
+        client,
+        "shared-batch-op",
+        [
+            {
+                "experiment_id": eid1,
+                "action": "resume",
+                "expected_version": 1,
+                "operation_id": "bp1",
+            }
+        ],
+    )
+    assert diff_action.status_code == 409
+
+    # 相同条目但顺序不同也视为不同请求：换两个全新实验验证顺序敏感性
+    third, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["u1", "u2"], seed=6
+    )
+    fourth, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["v1", "v2"], seed=7
+    )
+    eid3, eid4 = third["experiment_id"], fourth["experiment_id"]
+    ordered = [
+        {
+            "experiment_id": eid3,
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": "op3",
+            "reason": "hold",
+        },
+        {
+            "experiment_id": eid4,
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": "op4",
+            "reason": "hold",
+        },
+    ]
+    assert state_batch(client, "order-batch", ordered).status_code == 200
+    reordered = state_batch(client, "order-batch", list(reversed(ordered)))
+    assert reordered.status_code == 409
+    assert (
+        reordered.json()["detail"]["reason"] == "batch_operation_id_conflict"
+    )
+
+
+def test_state_batch_per_item_operation_id_conflict_rolls_back(
+    client: TestClient,
+) -> None:
+    exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    other, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=2
+    )
+    eid = exp["experiment_id"]
+    eid_other = other["experiment_id"]
+    # op-shared 已绑定为该实验的一次暂停（原因 first）
+    assert pause_experiment(
+        client, eid, "op-shared", "first reason"
+    ).status_code == 200
+
+    resp = state_batch(
+        client,
+        "batch-op-conflict",
+        [
+            # 其他实验本可通过
+            {
+                "experiment_id": eid_other,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-other",
+                "reason": "fine",
+            },
+            # 同 operation_id 绑定不同原因 → 冲突
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 1,
+                "operation_id": "op-shared",
+                "reason": "different reason",
+            },
+        ],
+    )
+    assert resp.status_code == 409
+    failures = resp.json()["detail"]["failures"]
+    assert len(failures) == 1
+    assert failures[0]["index"] == 1
+    assert failures[0]["reason"] == "operation_id_conflict"
+    assert failures[0]["operation_id"] == "op-shared"
+
+    # 整批回滚：其他实验未被暂停
+    assert client.get(f"/experiments/{eid_other}").json()["status"] == "active"
+    assert (
+        client.get(f"/experiments/{eid_other}/state-events").json()["events"]
+        == []
+    )
+
+    # operation_id 的幂等空间在批量与单条接口之间共享：
+    # 完全一致的条目在批量中作为重放，整批成功
+    consistent = state_batch(
+        client,
+        "batch-op-conflict",
+        [
+            {
+                "experiment_id": eid_other,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op-other",
+                "reason": "fine",
+            },
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 1,
+                "operation_id": "op-shared",
+                "reason": "first reason",
+            },
+        ],
+    )
+    assert consistent.status_code == 200, consistent.text
+    results = consistent.json()["results"]
+    # 第二条为重放事件（首次暂停的审计记录），版本仍为 1
+    assert results[1]["state_version"] == 1
+    assert results[1]["reason"] == "first reason"
+    # 第一条为新切换
+    assert results[0]["state_version"] == 1
+
+
+def test_state_batch_appends_audit_events_per_item(client: TestClient) -> None:
+    exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = exp["experiment_id"]
+
+    assert state_batch(
+        client,
+        "batch-audit",
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "audit-pause",
+                "reason": "batch hold",
+            }
+        ],
+    ).status_code == 200
+
+    events = client.get(f"/experiments/{eid}/state-events").json()["events"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["operation_id"] == "audit-pause"
+    assert event["action"] == "pause"
+    assert event["reason"] == "batch hold"
+    assert event["state_version"] == 1
+
+    # 在另一批中恢复
+    resumed = state_batch(
+        client,
+        "batch-audit-2",
+        [
+            {
+                "experiment_id": eid,
+                "action": "resume",
+                "expected_version": 1,
+                "operation_id": "audit-resume",
+                "reason": "batch release",
+            }
+        ],
+    )
+    assert resumed.status_code == 200
+    events = client.get(f"/experiments/{eid}/state-events").json()["events"]
+    assert [e["action"] for e in events] == ["resume", "pause"]
+    assert events[0]["state_version"] == 2
+
+
+def test_state_batch_paused_experiments_block_unblinding(
+    client: TestClient,
+) -> None:
+    exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = exp["experiment_id"]
+    assert state_batch(
+        client,
+        "batch-hold",
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "bp",
+                "reason": "hold",
+            }
+        ],
+    ).status_code == 200
+
+    advance = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    )
+    assert advance.status_code == 409
+    assert advance.json()["detail"]["reason"] == "experiment_paused"
+    batch = advance_batch(
+        client,
+        eid,
+        [{"subject_id": "s2", "expected_period": 1}],
+        "b1",
+    )
+    assert batch.status_code == 409
+    assert batch.json()["detail"]["reason"] == "experiment_paused"
+
+    # 批量恢复后揭盲恢复正常
+    assert state_batch(
+        client,
+        "batch-release",
+        [
+            {
+                "experiment_id": eid,
+                "action": "resume",
+                "expected_version": 1,
+                "operation_id": "br",
+            }
+        ],
+    ).status_code == 200
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    ).status_code == 200
+
+
+def test_state_batch_payload_validation(client: TestClient) -> None:
+    exp, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = exp["experiment_id"]
+
+    def call(items: list[dict], batch_id: str = "b"):
+        return state_batch(client, batch_id, items)
+
+    # 空条目列表
+    assert call([]).status_code == 422
+    # batch_operation_id 为空
+    assert call(
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op",
+                "reason": "x",
+            }
+        ],
+        batch_id="",
+    ).status_code == 422
+    # pause 缺少 reason
+    assert call(
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op",
+            }
+        ]
+    ).status_code == 422
+    # 非法动作
+    assert call(
+        [
+            {
+                "experiment_id": eid,
+                "action": "delete",
+                "expected_version": 0,
+                "operation_id": "op",
+                "reason": "x",
+            }
+        ]
+    ).status_code == 422
+    # 负的期望版本
+    assert call(
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": -1,
+                "operation_id": "op",
+                "reason": "x",
+            }
+        ]
+    ).status_code == 422
+    # 空 operation_id / experiment_id
+    assert call(
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "",
+                "reason": "x",
+            }
+        ]
+    ).status_code == 422
+    assert call(
+        [
+            {
+                "experiment_id": "",
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op",
+                "reason": "x",
+            }
+        ]
+    ).status_code == 422
+    # 同一实验在一批中出现两次
+    assert call(
+        [
+            {
+                "experiment_id": eid,
+                "action": "pause",
+                "expected_version": 0,
+                "operation_id": "op1",
+                "reason": "x",
+            },
+            {
+                "experiment_id": eid,
+                "action": "resume",
+                "expected_version": 1,
+                "operation_id": "op2",
+            },
+        ]
+    ).status_code == 422
+    # 超过 100 条
+    too_many = [
+        {
+            "experiment_id": f"e{i}",
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": f"op{i}",
+            "reason": "x",
+        }
+        for i in range(101)
+    ]
+    assert call(too_many).status_code == 422
+
+
+def test_state_batch_boundary_size_of_100_accepted(client: TestClient) -> None:
+    # 2 条件每组 2 人，创建 100 个实验
+    experiment_ids: list[str] = []
+    for i in range(100):
+        body, _ = create_experiment(
+            client,
+            conditions=["A", "B"],
+            subject_ids=[f"s{i}-1", f"s{i}-2"],
+            seed=i,
+        )
+        experiment_ids.append(body["experiment_id"])
+
+    items = [
+        {
+            "experiment_id": eid,
+            "action": "pause",
+            "expected_version": 0,
+            "operation_id": f"op-{i}",
+            "reason": "bulk hold",
+        }
+        for i, eid in enumerate(experiment_ids)
+    ]
+    resp = state_batch(client, "batch-100", items)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 100
+    assert [r["experiment_id"] for r in results] == experiment_ids
+    assert all(r["state_version"] == 1 for r in results)
+
+
+def test_state_batch_works_on_migrated_legacy_database(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "legacy-state-batch.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-batch", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-batch", "s1", 0, '["A","B"]'),
+        )
+
+    # 旧库启动自动迁移后，批量暂停 / 幂等重放 / 恢复均可用
+    with TestClient(app) as migrated:
+        resp = state_batch(
+            migrated,
+            "legacy-batch-op",
+            [
+                {
+                    "experiment_id": "legacy-batch",
+                    "action": "pause",
+                    "expected_version": 0,
+                    "operation_id": "lp1",
+                    "reason": "hold legacy batch",
+                }
+            ],
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"][0]["state_version"] == 1
+
+        blocked = migrated.post(
+            "/experiments/legacy-batch/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["reason"] == "experiment_paused"
+
+        # 幂等重放
+        replay = state_batch(
+            migrated,
+            "legacy-batch-op",
+            [
+                {
+                    "experiment_id": "legacy-batch",
+                    "action": "pause",
+                    "expected_version": 0,
+                    "operation_id": "lp1",
+                    "reason": "hold legacy batch",
+                }
+            ],
+        )
+        assert replay.status_code == 200
+        assert replay.json() == resp.json()
+
+        resumed = state_batch(
+            migrated,
+            "legacy-batch-resume",
+            [
+                {
+                    "experiment_id": "legacy-batch",
+                    "action": "resume",
+                    "expected_version": 1,
+                    "operation_id": "lr1",
+                }
+            ],
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["results"][0]["state_version"] == 2
+        assert migrated.post(
+            "/experiments/legacy-batch/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        ).status_code == 200
+
+
+def test_concurrent_state_batches_are_serialized(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-state-batch.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 41,
+            },
+        ).json()
+    eid = created["experiment_id"]
+
+    # 多线程同时暂停同一个版本 0 的实验：只有一批成功
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = state_batch(
+                local_client,
+                f"race-batch-{i}",
+                [
+                    {
+                        "experiment_id": eid,
+                        "action": "pause",
+                        "expected_version": 0,
+                        "operation_id": f"race-op-{i}",
+                        "reason": "race",
+                    }
+                ],
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+    with TestClient(app) as verify:
+        detail = verify.get(f"/experiments/{eid}").json()
+        assert detail["status"] == "paused"
+        assert detail["state_version"] == 1
+        events = verify.get(f"/experiments/{eid}/state-events").json()["events"]
+    assert len(events) == 1
+

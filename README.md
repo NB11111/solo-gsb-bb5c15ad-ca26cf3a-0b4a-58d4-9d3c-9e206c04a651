@@ -62,6 +62,34 @@
 实验的 `status`（`active` / `paused`）与 `state_version` 同时出现在创建、
 详情与列表接口的响应中，调用方可据此做乐观并发控制。
 
+### 批量暂停 / 恢复 `POST /experiments/state-batch`
+
+需要一次对多个实验切换状态时调用。提交一个全局 `batch_operation_id` 与
+1～100 个条目，每个条目携带目标实验、动作、期望状态版本与操作键：
+
+- 服务在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内**先统一校验全部**
+  条目——实验存在、当前 `state_version` 必须等于 `expected_version`、
+  目标状态可达（`pause` 要求当前为 `active`，`resume` 要求当前为
+  `paused`）、每个条目的 `operation_id` 未被同实验的其他操作占用；
+- **全部通过才按输入顺序**执行暂停 / 恢复（更新 `status` /
+  `state_version`）并为每个实验追加一条审计记录；
+- 任一条目冲突即返回 `409 state_batch_item_rejected`，在 `failures`
+  中按输入顺序列出**全部**失败条目的 `index` / `experiment_id` /
+  `reason`（及 `current_status` / `state_version` /
+  `expected_version`），且**整批零写入**——即使排在前面的实验本可切换，
+  也不会被暂停 / 恢复，不会产生任何审计记录；
+- 相同 `batch_operation_id` 与**完全相同的条目列表（含顺序）**重试，
+  返回首次结果（含首次状态事件），不重复切换、不重复递增版本；同一
+  `batch_operation_id` 绑定不同条目 / 版本 / 动作 / 顺序则返回
+  `409 batch_operation_id_conflict`；
+- 条目的 `operation_id` 与单条暂停 / 恢复接口共享同一个
+  `(实验, operation_id)` 审计幂等空间：条目绑定了同实验已存在但不一致
+  的操作时记为 `operation_id_conflict` 并整批拒绝；完全一致的已落盘操作
+  在批量中作为重放事件返回（不要求版本仍匹配、不重复切换）；
+- 同一实验在一批中只能出现一次（否则 `422`），因此不存在批内链式版本
+  依赖；`pause` 条目必须带非空 `reason`，`resume` 的 `reason` 可空。
+
+
 ## 快速启动（Docker Compose，一条命令）
 
 ```bash
@@ -70,11 +98,12 @@ docker compose up --build
 
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
-启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计表通过
-`CREATE TABLE IF NOT EXISTS` 自动补齐，`experiments` 表新增的 `washout_seconds`、
-`status`、`state_version` 列通过幂等的 `ALTER TABLE ... DEFAULT`
+启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换表
+通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，`experiments` 表新增的
+`washout_seconds`、`status`、`state_version` 列通过幂等的
+`ALTER TABLE ... DEFAULT`
 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、状态版本 0 处理**，
-旧数据保留且可继续揭盲、登记完成、暂停与恢复。
+旧数据保留且可继续揭盲、登记完成、暂停 / 恢复与批量状态切换。
 
 - **访问地址**：http://localhost:8000
 - **交互式 API 文档（Swagger UI）**：http://localhost:8000/docs
@@ -427,6 +456,85 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/resume \
 恢复后单条与批量揭盲立即恢复；暂停期间被 `409 experiment_paused` 拒绝的
 请求**未消耗幂等键**，用原 `request_id` / `batch_id` 重试即为首次成功。
 
+恢复后单条与批量揭盲立即恢复；暂停期间被 `409 experiment_paused` 拒绝的
+请求**未消耗幂等键**，用原 `request_id` / `batch_id` 重试即为首次成功。
+
+### 批量暂停 / 恢复 `POST /experiments/state-batch`
+
+跨实验批量切换状态，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_operation_id` | 整批的全局幂等键（如 UUID），同一批请求重试必须复用 |
+| `items` | 1～100 个条目，按该列表顺序执行并返回结果；同一实验在一批中只能出现一次 |
+| `items[].experiment_id` | 目标实验 ID |
+| `items[].action` | `pause` 或 `resume` |
+| `items[].expected_version` | 调用方看到的该实验当前 `state_version`；与服务端不一致则该条目失败 |
+| `items[].operation_id` | 本条状态变更的唯一操作键，随审计记录持久化（与单条接口共享幂等空间） |
+| `items[].reason` | `pause` 时必填、`resume` 时可空，随审计记录持久化 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/state-batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_operation_id": "a3f8…",
+        "items": [
+          {"experiment_id": "<exp-1>", "action": "pause",
+           "expected_version": 0, "operation_id": "op-1", "reason": "批次冻结"},
+          {"experiment_id": "<exp-2>", "action": "resume",
+           "expected_version": 3, "operation_id": "op-2", "reason": "复核通过"}
+        ]
+      }'
+```
+
+服务在单个 `BEGIN IMMEDIATE` 写事务内**先校验全部条目、再按顺序执行**。
+全部通过返回 `200`，`results` 为与 `items` 同序的状态事件：
+
+```json
+{
+  "batch_operation_id": "a3f8…",
+  "results": [
+    {"id": 1, "experiment_id": "<exp-1>", "operation_id": "op-1",
+     "action": "pause", "from_status": "active", "to_status": "paused",
+     "state_version": 1, "reason": "批次冻结", "created_at": "…"},
+    {"id": 2, "experiment_id": "<exp-2>", "operation_id": "op-2",
+     "action": "resume", "from_status": "paused", "to_status": "active",
+     "state_version": 4, "reason": "复核通过", "created_at": "…"}
+  ]
+}
+```
+
+任一条目未通过即整批回滚并返回 `409`，`failures` 列出全部失败条目：
+
+```json
+{
+  "detail": {
+    "message": "批量中存在未通过状态 / 版本校验的条目，整批未切换",
+    "reason": "state_batch_item_rejected",
+    "batch_operation_id": "a3f8…",
+    "failures": [
+      {"index": 0, "experiment_id": "<exp-1>",
+       "reason": "state_version_mismatch", "current_status": "paused",
+       "state_version": 3, "expected_version": 0},
+      {"index": 1, "experiment_id": "<exp-2>", "reason": "experiment_not_found"}
+    ]
+  }
+}
+```
+
+- 失败原因：`state_version_mismatch`（期望版本过期，回传当前版本与状态）、
+  `already_paused` / `already_active`（目标状态与当前状态相同）、
+  `operation_id_conflict`（该实验的 `operation_id` 已绑定其他动作 /
+  期望版本 / 原因）、`experiment_not_found`（实验不存在）；
+- `index` 为失败条目在 `items` 中的下标（从 0 开始），失败按输入顺序排列；
+- 失败路径**不切换任何实验、不追加任何审计**，且不消耗
+  `batch_operation_id` 与各条目 `operation_id`，修正后用原键重试即可首次成功；
+- 批量幂等：相同 `(batch_operation_id)` 与完全相同的条目列表（含顺序）重试
+  返回**首次结果**，即使实验状态已继续变化也不重复切换；绑定不同条目返回
+  `409 batch_operation_id_conflict`；
+- 条目数不在 1～100、同一实验重复出现、`pause` 缺少 `reason`、
+  `expected_version` 为负等请求体问题返回 `422`。
+
 ### 查询状态变更审计 `GET /experiments/{experiment_id}/state-events`
 
 返回暂停 / 恢复的审计记录，**按时间倒序**（最新在前），支持分页：
@@ -464,7 +572,7 @@ curl 'http://localhost:8000/experiments/<experiment_id>/state-events?limit=100&o
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -475,7 +583,7 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共十张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十一张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
@@ -488,12 +596,22 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
     与首次结果（成员或顺序不同即 `409`）；
   - `experiment_state_events`：暂停 / 恢复的追加式审计记录（自增 `id`、
     `action`、前后状态、`state_version`、原因、时间戳），按
-    `(实验, operation_id)` 唯一约束支持操作幂等重放，查询按 `id DESC` 时间倒序。
+    `(实验, operation_id)` 唯一约束支持操作幂等重放，查询按 `id DESC` 时间倒序；
+  - `state_batches`：批量暂停 / 恢复按全局 `batch_operation_id`
+    保存首次绑定的有序条目（实验 / 动作 / 期望版本 / operation_id / 原因）
+    与首次状态事件，条目或顺序不同即 `409`；新表对旧库以
+    `CREATE TABLE IF NOT EXISTS` 自动补齐。
 - **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
   “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
   恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，
   并发恢复只有一个赢家；暂停门禁同样在揭盲写事务内判定，与暂停 / 恢复互斥：
   事务提交后的揭盲必看到 `paused` 而拒绝，不会出现暂停后仍漏出条件。
+- **批量状态切换的原子性**：`state-batch` 在单个 `BEGIN IMMEDIATE` 事务内先做
+  “`batch_operation_id` 幂等检查 → 全部条目的存在性 / operation_id 绑定 /
+  版本 / 目标状态校验”，任一冲突汇总全部失败项并由外层事务回滚，
+  不更新任何 `experiments` 行、不插入任何审计；全部通过才按输入顺序逐条更新
+  状态、递增各自的 `state_version` 并追加审计，最后写入 `state_batches`
+  首次结果后一起提交。并发批次经写锁串行化，同一版本的暂停只有一批成功。
 - **原子推进与完成门禁**：推进、完成与批量推进都在单个 `BEGIN IMMEDIATE` 事务内完成
   “幂等检查 → 顺序 / 周期校验 → 写入并提交”，配合 `busy_timeout` 让并发请求串行化：
   每个周期只有一个完成请求、一次推进成功，其余得到 `409`；推进时**服务端时间在锁内读取**，

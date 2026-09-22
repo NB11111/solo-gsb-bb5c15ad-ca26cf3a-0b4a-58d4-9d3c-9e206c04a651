@@ -213,6 +213,81 @@ class ResumeRequest(BaseModel):
     )
 
 
+class StateBatchItem(BaseModel):
+    """批量状态切换中的一个实验：目标动作、期望状态版本与操作键。"""
+
+    experiment_id: str = Field(
+        ..., min_length=1, description="目标实验 ID"
+    )
+    action: Literal["pause", "resume"] = Field(
+        ..., description="目标动作：pause（暂停）或 resume（恢复）"
+    )
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "调用方看到的该实验当前状态版本；服务端仅在当前版本与之相等时才切换，"
+            "否则该条目标记为 state_version_mismatch 并整批拒绝"
+        ),
+    )
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本条状态变更的唯一操作键（如 UUID），随审计记录持久化",
+    )
+    reason: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "暂停 / 恢复原因，随审计记录持久化；action 为 pause 时必填，"
+            "resume 时可空"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _pause_requires_reason(self) -> "StateBatchItem":
+        if self.action == "pause" and not self.reason:
+            raise ValueError("action 为 pause 时 reason 必填")
+        return self
+
+
+class StateBatchRequest(BaseModel):
+    """批量状态切换请求：1～100 个条目，同一实验在一批中只能出现一次。"""
+
+    batch_operation_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "整批的全局幂等键（如 UUID）；相同键与相同条目列表重试返回首次结果"
+        ),
+    )
+    items: list[StateBatchItem] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="批量条目（1～100 个），按该列表顺序执行并返回结果",
+    )
+
+    @model_validator(mode="after")
+    def _items_must_target_distinct_experiments(self) -> "StateBatchRequest":
+        seen: set[str] = set()
+        for item in self.items:
+            if item.experiment_id in seen:
+                raise ValueError(
+                    "items 中同一实验只能出现一次：存在重复的 experiment_id "
+                    f"（{item.experiment_id}）"
+                )
+            seen.add(item.experiment_id)
+        return self
+
+
+class StateBatchOut(BaseModel):
+    """批量状态切换结果：状态事件严格按请求 items 的输入顺序返回。"""
+
+    batch_operation_id: str
+    results: list[StateEventOut]
+
+
 class StateEventOut(BaseModel):
     """一条实验状态变更审计记录。"""
 

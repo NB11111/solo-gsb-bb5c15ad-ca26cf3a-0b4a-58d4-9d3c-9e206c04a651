@@ -31,6 +31,8 @@ from .schemas import (
     PauseRequest,
     ProgressOut,
     ResumeRequest,
+    StateBatchOut,
+    StateBatchRequest,
     StateEventOut,
     StateEventsOut,
 )
@@ -47,7 +49,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -473,6 +475,47 @@ def resume_experiment(experiment_id: str, payload: ResumeRequest) -> dict:
     if event is None:
         raise HTTPException(status_code=404, detail="experiment not found")
     return event
+
+
+@app.post(
+    "/experiments/state-batch",
+    response_model=StateBatchOut,
+    status_code=200,
+    summary=(
+        "批量暂停 / 恢复：单个写事务内先校验全部实验的状态版本与目标动作，"
+        "全部通过才执行切换并追加审计；任一冲突整批零写入并返回 409，"
+        "相同 batch_operation_id 幂等返回首次结果"
+    ),
+)
+def state_batch(payload: StateBatchRequest) -> dict:
+    try:
+        result = db.state_batch(
+            payload.batch_operation_id,
+            [m.model_dump() for m in payload.items],
+        )
+    except db.StateBatchConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "batch_operation_id 已被条目列表不同的其他批量请求占用"
+                ),
+                "reason": "batch_operation_id_conflict",
+                "batch_operation_id": payload.batch_operation_id,
+            },
+        )
+    except db.StateBatchItemsRejectedError as exc:
+        # 整批校验未通过：只列各失败条目的序号、实验 ID 与原因，整批未做任何切换
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "批量中存在未通过状态 / 版本校验的条目，整批未切换",
+                "reason": "state_batch_item_rejected",
+                "batch_operation_id": payload.batch_operation_id,
+                "failures": exc.failures,
+            },
+        )
+    return result
 
 
 @app.get(
