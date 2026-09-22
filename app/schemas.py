@@ -232,3 +232,69 @@ class StateEventsOut(BaseModel):
 
     experiment_id: str
     events: list[StateEventOut]
+
+
+class StateTransitionOperation(BaseModel):
+    """批量状态切换中的单项操作：目标实验、动作、期望版本与操作幂等键。"""
+
+    experiment_id: str = Field(..., min_length=1, description="目标实验 ID")
+    action: Literal["pause", "resume"] = Field(
+        ..., description="目标动作：pause（暂停）或 resume（恢复）"
+    )
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "调用方看到的该实验状态版本；服务端仅在当前版本与之相等且状态"
+            "允许目标动作时才执行，否则整批 409"
+        ),
+    )
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本项操作的唯一幂等键（如 UUID），与单条暂停 / 恢复共享幂等空间",
+    )
+    reason: str | None = Field(
+        default=None,
+        min_length=1,
+        description="可选的暂停 / 恢复原因，随审计记录持久化",
+    )
+
+
+class StateTransitionBatchRequest(BaseModel):
+    """批量状态切换请求：1～100 项操作，同一实验每批最多出现一次。"""
+
+    batch_operation_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "整批幂等键（如 UUID），相同 batch_operation_id 与相同操作列表"
+            "重试返回首次结果"
+        ),
+    )
+    operations: list[StateTransitionOperation] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description=(
+            "状态切换操作列表（1～100 项），全部校验通过才按输入顺序执行，"
+            "任一项冲突整批回滚"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _experiments_must_be_distinct(self) -> "StateTransitionBatchRequest":
+        seen: set[str] = set()
+        for operation in self.operations:
+            if operation.experiment_id in seen:
+                raise ValueError(
+                    "operations 必须互异：同一实验在同一批中最多出现一次"
+                )
+            seen.add(operation.experiment_id)
+        return self
+
+
+class StateTransitionBatchOut(BaseModel):
+    batch_operation_id: str
+    # 结果严格按请求 operations 的输入顺序返回
+    results: list[StateEventOut]

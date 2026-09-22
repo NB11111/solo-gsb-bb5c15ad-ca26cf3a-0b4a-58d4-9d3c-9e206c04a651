@@ -33,6 +33,8 @@ from .schemas import (
     ResumeRequest,
     StateEventOut,
     StateEventsOut,
+    StateTransitionBatchOut,
+    StateTransitionBatchRequest,
 )
 from .williams import group_size, williams_sequences
 
@@ -47,7 +49,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -473,6 +475,46 @@ def resume_experiment(experiment_id: str, payload: ResumeRequest) -> dict:
     if event is None:
         raise HTTPException(status_code=404, detail="experiment not found")
     return event
+
+
+@app.post(
+    "/experiments/state-batch",
+    response_model=StateTransitionBatchOut,
+    summary=(
+        "批量状态切换：一次提交 batch_operation_id 与多个实验的暂停 / 恢复操作，"
+        "同一事务内先校验全部状态与版本，全部通过才执行并追加审计；"
+        "任一冲突整批回滚，重复 batch_operation_id 幂等返回首次结果"
+    ),
+)
+def transition_experiment_states_batch(
+    payload: StateTransitionBatchRequest,
+) -> dict:
+    try:
+        return db.apply_state_transition_batch(
+            payload.batch_operation_id,
+            [operation.model_dump() for operation in payload.operations],
+        )
+    except db.BatchOperationIdConflictError:
+        # 同一 batch_operation_id 绑定了不同的操作列表
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "batch_operation_id 已被操作列表不同的其他批量请求占用",
+                "reason": "batch_operation_id_conflict",
+                "batch_operation_id": payload.batch_operation_id,
+            },
+        )
+    except db.BatchStateTransitionsRejectedError as exc:
+        # 整批校验未通过：按输入顺序列出各失败项，整批零写入
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "批量状态切换中存在未通过校验的操作，整批未执行",
+                "reason": "batch_operation_rejected",
+                "batch_operation_id": payload.batch_operation_id,
+                "failures": exc.failures,
+            },
+        )
 
 
 @app.get(

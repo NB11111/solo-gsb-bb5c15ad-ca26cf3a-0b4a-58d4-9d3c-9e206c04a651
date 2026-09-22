@@ -55,6 +55,12 @@
 - 相同 `operation_id` 重放返回首次结果；同一 `operation_id` 绑定不同动作 /
   原因（或恢复时绑定不同的 `expected_version`）返回 `409 operation_id_conflict`。
   暂停与恢复共享同一个 `(实验, operation_id)` 幂等空间；
+- **批量状态切换** `POST /experiments/state-batch`：一次提交 `batch_operation_id`
+  与 1～100 项操作（每项含 `experiment_id`、`action`、`expected_version`、
+  `operation_id` 与可选 `reason`），服务在**单个 SQLite 写事务**内先校验全部
+  实验的状态与版本，**全部通过才按输入顺序执行**暂停 / 恢复并逐项追加审计；
+  任一项冲突即返回 `409` 并**整批回滚、零写入**。相同 `batch_operation_id`
+  与相同操作列表（含顺序）重试返回首次结果；
 - 每次暂停 / 恢复都追加写入 `experiment_state_events` 审计表，可通过
   `GET /experiments/{id}/state-events` 按**时间倒序**（最新在前）分页查询，
   支持 `limit`（1～500，默认 100）与 `offset`。
@@ -70,8 +76,8 @@ docker compose up --build
 
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
-启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计表通过
-`CREATE TABLE IF NOT EXISTS` 自动补齐，`experiments` 表新增的 `washout_seconds`、
+启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换表
+通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，`experiments` 表新增的 `washout_seconds`、
 `status`、`state_version` 列通过幂等的 `ALTER TABLE ... DEFAULT`
 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、状态版本 0 处理**，
 旧数据保留且可继续揭盲、登记完成、暂停与恢复。
@@ -427,6 +433,82 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/resume \
 恢复后单条与批量揭盲立即恢复；暂停期间被 `409 experiment_paused` 拒绝的
 请求**未消耗幂等键**，用原 `request_id` / `batch_id` 重试即为首次成功。
 
+### 批量状态切换 `POST /experiments/state-batch`
+
+一次对**多个实验**执行暂停 / 恢复，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_operation_id` | 整批幂等键（如 UUID），同一批请求重试必须复用 |
+| `operations` | 1～100 项操作，每项含 `experiment_id`、`action`（`pause` / `resume`）、`expected_version`、`operation_id` 与可选 `reason`；同一实验在同一批中最多出现一次，全部通过才按该列表顺序执行 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/state-batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_operation_id": "c41d…",
+        "operations": [
+          {"experiment_id": "exp-1", "action": "pause", "expected_version": 0,
+           "operation_id": "op-1", "reason": "安全性复核"},
+          {"experiment_id": "exp-2", "action": "resume", "expected_version": 3,
+           "operation_id": "op-2"}
+        ]
+      }'
+```
+
+服务在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内先对**全部**操作逐项校验：
+实验存在、`state_version == expected_version`、当前状态允许目标动作
+（暂停要求 `active`，恢复要求 `paused`），且 `operation_id` 未绑定其他操作。
+**全部通过才按输入顺序执行**状态切换并逐项追加 `experiment_state_events`
+审计；任一项冲突即返回 `409` 并**整批回滚、零写入**：
+
+```json
+{
+  "detail": {
+    "message": "批量状态切换中存在未通过校验的操作，整批未执行",
+    "reason": "batch_operation_rejected",
+    "batch_operation_id": "c41d…",
+    "failures": [
+      {"experiment_id": "exp-2", "operation_id": "op-2",
+       "reason": "state_version_mismatch", "current_status": "paused",
+       "state_version": 4, "expected_version": 3}
+    ]
+  }
+}
+```
+
+- `failures[]` 按输入顺序列出每项失败的 `experiment_id` / `operation_id` 与
+  `reason`（`experiment_not_found` / `state_version_mismatch` / `already_paused` /
+  `already_active` / `operation_id_conflict`），状态类原因附服务端当前的
+  `current_status` / `state_version`；
+- 校验失败不写入 `state_transition_batches`、不消耗 `batch_operation_id`，
+  修正后用**同一个 `batch_operation_id`** 重试即首次成功；
+- 全部通过时返回 `200`，`results` 为按输入顺序排列的审计事件
+  （结构同单条暂停 / 恢复响应）：
+
+```json
+{
+  "batch_operation_id": "c41d…",
+  "results": [
+    {"id": 7, "experiment_id": "exp-1", "operation_id": "op-1", "action": "pause",
+     "from_status": "active", "to_status": "paused", "state_version": 1,
+     "reason": "安全性复核", "created_at": "…"},
+    {"id": 3, "experiment_id": "exp-2", "operation_id": "op-2", "action": "resume",
+     "from_status": "paused", "to_status": "active", "state_version": 4,
+     "reason": null, "created_at": "…"}
+  ]
+}
+```
+
+- 相同 `batch_operation_id` 与**完全相同的操作列表（含顺序）**重试返回首次
+  结果，不重复变更、不重复写审计；绑定不同操作列表返回 `409`
+  （`batch_operation_id_conflict`）；
+- 单项 `operation_id` 与单条暂停 / 恢复共享同一个 `(实验, operation_id)`
+  幂等空间：某项引用的 `operation_id` 已存在且动作 / 期望版本 / 原因完全
+  一致时，该项按**幂等重放**返回首次审计事件（不重复执行），其余项照常
+  校验执行；不一致则整批 `409`（`operation_id_conflict`）；
+- 操作数量不在 1～100、同一实验重复出现或字段非法返回 `422`。
+
 ### 查询状态变更审计 `GET /experiments/{experiment_id}/state-events`
 
 返回暂停 / 恢复的审计记录，**按时间倒序**（最新在前），支持分页：
@@ -464,7 +546,7 @@ curl 'http://localhost:8000/experiments/<experiment_id>/state-events?limit=100&o
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -475,7 +557,7 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共十张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十一张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
@@ -488,12 +570,20 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
     与首次结果（成员或顺序不同即 `409`）；
   - `experiment_state_events`：暂停 / 恢复的追加式审计记录（自增 `id`、
     `action`、前后状态、`state_version`、原因、时间戳），按
-    `(实验, operation_id)` 唯一约束支持操作幂等重放，查询按 `id DESC` 时间倒序。
+    `(实验, operation_id)` 唯一约束支持操作幂等重放，查询按 `id DESC` 时间倒序；
+  - `state_transition_batches`：批量状态切换按 `batch_operation_id`（全局唯一）
+    保存首次绑定的有序操作列表与首次结果（操作列表或顺序不同即 `409`）。
 - **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
   “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
   恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，
   并发恢复只有一个赢家；暂停门禁同样在揭盲写事务内判定，与暂停 / 恢复互斥：
   事务提交后的揭盲必看到 `paused` 而拒绝，不会出现暂停后仍漏出条件。
+- **批量状态切换的原子性**：批量暂停 / 恢复在同一 `BEGIN IMMEDIATE` 事务内
+  **先统一校验全部操作**（实验存在、版本 compare-and-set、状态机、单项幂等），
+  全部通过才**按输入顺序**更新各实验并逐项追加审计，最后落盘整批幂等结果；
+  任一项冲突整体回滚、零写入，并发批量只有一个赢家。单项 `operation_id`
+  与单条暂停 / 恢复共享 `(实验, operation_id)` 幂等空间，已存在且参数一致的
+  操作按幂等重放处理，不会重复变更或重复写审计。
 - **原子推进与完成门禁**：推进、完成与批量推进都在单个 `BEGIN IMMEDIATE` 事务内完成
   “幂等检查 → 顺序 / 周期校验 → 写入并提交”，配合 `busy_timeout` 让并发请求串行化：
   每个周期只有一个完成请求、一次推进成功，其余得到 `409`；推进时**服务端时间在锁内读取**，

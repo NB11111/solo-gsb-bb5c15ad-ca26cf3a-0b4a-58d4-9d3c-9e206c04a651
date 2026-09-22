@@ -23,6 +23,9 @@
   ``ALTER TABLE ... DEFAULT`` 补齐，旧实验一律按 active / 版本 0 处理。
 * ``experiment_state_events``：暂停 / 恢复的追加式审计记录，
   按 ``(实验, operation_id)`` 唯一约束支持操作幂等重放，查询按时间倒序。
+* ``state_transition_batches``：跨实验批量状态切换（暂停 / 恢复）的幂等结果，
+  按 ``batch_operation_id`` 全局去重，保存首次请求绑定的有序操作列表
+  与首次执行结果；整批在同一事务内“先统一校验、再一起写入”。
 """
 
 from __future__ import annotations
@@ -129,6 +132,15 @@ CREATE TABLE IF NOT EXISTS experiment_state_events (
     created_at     TEXT NOT NULL,
     UNIQUE (experiment_id, operation_id)
 );
+
+CREATE TABLE IF NOT EXISTS state_transition_batches (
+    batch_operation_id TEXT PRIMARY KEY,  -- 整批幂等键（跨实验，全局唯一）
+    operations         TEXT NOT NULL,     -- JSON：首次请求绑定的有序操作列表
+                                          -- [{experiment_id, action, expected_version,
+                                          --   operation_id, reason}]
+    results            TEXT NOT NULL,     -- JSON：首次结果（按输入顺序的审计事件列表）
+    created_at         TEXT NOT NULL
+);
 """
 
 
@@ -204,6 +216,25 @@ class ExperimentPausedError(Exception):
 
 class OperationIdConflictError(Exception):
     """operation_id 已被另一个操作（不同动作 / 原因 / 期望版本）占用。"""
+
+
+class BatchOperationIdConflictError(Exception):
+    """batch_operation_id 已被操作列表不同的另一次批量状态切换请求占用。"""
+
+
+class BatchStateTransitionsRejectedError(Exception):
+    """批量状态切换中至少一项未通过状态 / 版本校验，整批必须零写入。
+
+    :param failures: 每个失败操作一项，键为 ``experiment_id`` /
+        ``operation_id`` / ``reason``；状态类原因附带服务端当前的
+        ``current_status`` / ``state_version`` 与调用方的 ``expected_version``。
+    """
+
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
+        self.failures = failures
+        super().__init__(
+            f"batch state transitions rejected: {len(failures)} failure(s)"
+        )
 
 
 class InvalidStateTransitionError(Exception):
@@ -1165,6 +1196,221 @@ def _resume_locked(
         (cursor.lastrowid,),
     ).fetchone()
     return _event_payload(inserted, False)
+
+
+def apply_state_transition_batch(
+    batch_operation_id: str,
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """在单个写事务内对多个实验批量执行暂停 / 恢复。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 整批幂等检查：``batch_operation_id`` 已存在时，仅当本次操作列表
+       （``experiment_id`` / ``action`` / ``expected_version`` /
+       ``operation_id`` / ``reason`` 及顺序）与首次完全一致才返回首次结果，
+       否则抛出 :class:`BatchOperationIdConflictError`；
+    2. 统一校验：对每项操作先做单项幂等检查——``(实验, operation_id)``
+       已存在且动作 / 期望版本 / 原因与首条审计一致时，该项直接重放首次
+       审计事件（不重复执行），不一致记为 ``operation_id_conflict`` 失败；
+       未命中幂等键的项再校验实验存在、
+       ``state_version == expected_version``（compare-and-set）、当前状态
+       允许目标动作（暂停要求 ``active``，恢复要求 ``paused``）。
+       任一项失败即汇总全部失败项并抛出
+       :class:`BatchStateTransitionsRejectedError`，**整批回滚、零写入**；
+    3. 执行：全部通过后按输入顺序更新 ``experiments``、逐项追加
+       ``experiment_state_events`` 审计，最后落盘
+       ``state_transition_batches`` 幂等结果，一起提交或一起回滚。
+
+    返回 ``batch_operation_id`` 与按输入顺序排列的审计事件列表。
+    """
+    return _transactional_state_change(
+        _state_transition_batch_locked, batch_operation_id, operations
+    )
+
+
+def _state_transition_batch_locked(
+    conn: sqlite3.Connection,
+    batch_operation_id: str,
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    # 操作身份：用于整批幂等绑定与持久化（字段固定、顺序敏感）
+    request_operations = [
+        {
+            "experiment_id": op["experiment_id"],
+            "action": op["action"],
+            "expected_version": op["expected_version"],
+            "operation_id": op["operation_id"],
+            "reason": op["reason"],
+        }
+        for op in operations
+    ]
+
+    # 1) 整批幂等：操作列表（含顺序）一致才返回首次结果，否则 409
+    batch_row = conn.execute(
+        "SELECT operations, results FROM state_transition_batches "
+        "WHERE batch_operation_id = ?",
+        (batch_operation_id,),
+    ).fetchone()
+    if batch_row is not None:
+        if json.loads(batch_row["operations"]) != request_operations:
+            raise BatchOperationIdConflictError()
+        return {
+            "batch_operation_id": batch_operation_id,
+            "results": json.loads(batch_row["results"]),
+            "_replayed": True,
+        }
+
+    # 2) 统一校验：单项幂等 → 实验存在 → 版本 compare-and-set → 状态机校验。
+    #    计划列表只收集通过项；任一项失败都先汇总，校验阶段零写入。
+    results: list[dict[str, Any] | None] = [None] * len(request_operations)
+    plan: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for index, op in enumerate(request_operations):
+        experiment_id = op["experiment_id"]
+        action = op["action"]
+        expected_version = op["expected_version"]
+        operation_id = op["operation_id"]
+        reason = op["reason"]
+
+        experiment_row = conn.execute(
+            "SELECT status, state_version FROM experiments WHERE id = ?",
+            (experiment_id,),
+        ).fetchone()
+        if experiment_row is None:
+            failures.append(
+                {
+                    "experiment_id": experiment_id,
+                    "operation_id": operation_id,
+                    "reason": "experiment_not_found",
+                }
+            )
+            continue
+
+        # 单项幂等：与单条暂停 / 恢复共享同一 (实验, operation_id) 空间，
+        # 命中且参数一致时重放首条审计事件（审计版本恰为期望版本 + 1）
+        event_row = conn.execute(
+            "SELECT * FROM experiment_state_events "
+            "WHERE experiment_id = ? AND operation_id = ?",
+            (experiment_id, operation_id),
+        ).fetchone()
+        if event_row is not None:
+            if (
+                event_row["action"] != action
+                or int(event_row["state_version"]) - 1 != expected_version
+                or event_row["reason"] != reason
+            ):
+                failures.append(
+                    {
+                        "experiment_id": experiment_id,
+                        "operation_id": operation_id,
+                        "reason": "operation_id_conflict",
+                    }
+                )
+            else:
+                results[index] = _state_event_dict(event_row)
+            continue
+
+        current_status = experiment_row["status"]
+        current_version = int(experiment_row["state_version"])
+        failure: dict[str, Any] | None = None
+        if current_version != expected_version:
+            failure = {
+                "experiment_id": experiment_id,
+                "operation_id": operation_id,
+                "reason": "state_version_mismatch",
+                "current_status": current_status,
+                "state_version": current_version,
+                "expected_version": expected_version,
+            }
+        elif action == "pause" and current_status != "active":
+            failure = {
+                "experiment_id": experiment_id,
+                "operation_id": operation_id,
+                "reason": "already_paused",
+                "current_status": current_status,
+                "state_version": current_version,
+                "expected_version": expected_version,
+            }
+        elif action == "resume" and current_status != "paused":
+            failure = {
+                "experiment_id": experiment_id,
+                "operation_id": operation_id,
+                "reason": "already_active",
+                "current_status": current_status,
+                "state_version": current_version,
+                "expected_version": expected_version,
+            }
+
+        if failure is not None:
+            failures.append(failure)
+        else:
+            plan.append(
+                {
+                    "index": index,
+                    "experiment_id": experiment_id,
+                    "action": action,
+                    "from_status": current_status,
+                    "to_status": "paused" if action == "pause" else "active",
+                    "new_version": current_version + 1,
+                    "operation_id": operation_id,
+                    "reason": reason,
+                }
+            )
+
+    if failures:
+        # 整批零写入：不变更任何实验、不写审计，由外层事务回滚
+        raise BatchStateTransitionsRejectedError(failures)
+
+    # 3) 全部通过：按输入顺序执行状态切换并追加审计（时间戳在锁内生成）
+    for item in plan:
+        created_at = utc_now().isoformat()
+        conn.execute(
+            "UPDATE experiments SET status = ?, state_version = ? WHERE id = ?",
+            (item["to_status"], item["new_version"], item["experiment_id"]),
+        )
+        cursor = conn.execute(
+            "INSERT INTO experiment_state_events "
+            "(experiment_id, operation_id, action, from_status, to_status, "
+            "state_version, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item["experiment_id"],
+                item["operation_id"],
+                item["action"],
+                item["from_status"],
+                item["to_status"],
+                item["new_version"],
+                item["reason"],
+                created_at,
+            ),
+        )
+        inserted = conn.execute(
+            "SELECT * FROM experiment_state_events WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        results[item["index"]] = _state_event_dict(inserted)
+
+    # 校验全部通过后，每项都有重放或新写入的审计事件（无空洞）
+    final_results = [event for event in results if event is not None]
+    conn.execute(
+        "INSERT INTO state_transition_batches "
+        "(batch_operation_id, operations, results, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            batch_operation_id,
+            json.dumps(request_operations, ensure_ascii=False),
+            json.dumps(final_results, ensure_ascii=False),
+            utc_now().isoformat(),
+        ),
+    )
+
+    return {
+        "batch_operation_id": batch_operation_id,
+        "results": final_results,
+        "_replayed": False,
+    }
 
 
 def list_state_events(

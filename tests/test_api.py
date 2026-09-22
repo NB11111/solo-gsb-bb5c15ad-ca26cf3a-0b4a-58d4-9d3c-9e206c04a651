@@ -2075,3 +2075,510 @@ def test_legacy_database_defaults_to_active_version_zero(
             "/experiments/legacy-pause/advance",
             json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
         ).status_code == 200
+
+
+# ---------- 批量状态切换（跨实验暂停 / 恢复） ----------
+
+def state_batch(
+    client: TestClient,
+    batch_operation_id: str,
+    operations: list[dict],
+):
+    return client.post(
+        "/experiments/state-batch",
+        json={
+            "batch_operation_id": batch_operation_id,
+            "operations": operations,
+        },
+    )
+
+
+def transition_op(
+    experiment_id: str,
+    action: str,
+    expected_version: int,
+    operation_id: str,
+    reason: str | None = None,
+) -> dict:
+    op = {
+        "experiment_id": experiment_id,
+        "action": action,
+        "expected_version": expected_version,
+        "operation_id": operation_id,
+    }
+    if reason is not None:
+        op["reason"] = reason
+    return op
+
+
+def create_two_experiments(client: TestClient) -> tuple[str, str]:
+    first, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    second, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"t{i}" for i in range(6)],
+        seed=2,
+    )
+    return first["experiment_id"], second["experiment_id"]
+
+
+def test_state_batch_pauses_multiple_experiments_in_one_transaction(
+    client: TestClient,
+) -> None:
+    eid1, eid2 = create_two_experiments(client)
+
+    operations = [
+        transition_op(eid2, "pause", 0, "b-op-2", "hold-2"),
+        transition_op(eid1, "pause", 0, "b-op-1", "hold-1"),
+    ]
+    resp = state_batch(client, "sb-1", operations)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["batch_operation_id"] == "sb-1"
+    # 结果严格按输入顺序返回
+    assert [r["experiment_id"] for r in body["results"]] == [eid2, eid1]
+    assert [r["operation_id"] for r in body["results"]] == ["b-op-2", "b-op-1"]
+    for result, reason in zip(body["results"], ["hold-2", "hold-1"]):
+        assert result["action"] == "pause"
+        assert result["from_status"] == "active"
+        assert result["to_status"] == "paused"
+        assert result["state_version"] == 1
+        assert result["reason"] == reason
+        assert "id" in result
+        assert "created_at" in result
+    assert_no_sequence_leak(body)
+
+    # 两个实验都已暂停，审计各一条，揭盲被门禁拦截
+    for eid, subject_id in ((eid1, "s1"), (eid2, "t0")):
+        detail = client.get(f"/experiments/{eid}").json()
+        assert detail["status"] == "paused"
+        assert detail["state_version"] == 1
+        events = client.get(f"/experiments/{eid}/state-events").json()["events"]
+        assert len(events) == 1
+        blocked = client.post(
+            f"/experiments/{eid}/advance",
+            json={
+                "subject_id": subject_id,
+                "expected_period": 1,
+                "request_id": "a1",
+            },
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["reason"] == "experiment_paused"
+
+
+def test_state_batch_mixed_pause_and_resume(client: TestClient) -> None:
+    eid1, eid2 = create_two_experiments(client)
+    # eid2 先暂停到版本 1
+    assert pause_experiment(client, eid2, "pre-pause", "hold").status_code == 200
+
+    resp = state_batch(
+        client,
+        "sb-mixed",
+        [
+            transition_op(eid1, "pause", 0, "m-op-1"),
+            transition_op(eid2, "resume", 1, "m-op-2", "review ok"),
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    results = {r["experiment_id"]: r for r in resp.json()["results"]}
+    assert results[eid1]["action"] == "pause"
+    assert results[eid1]["to_status"] == "paused"
+    assert results[eid1]["state_version"] == 1
+    assert results[eid1]["reason"] is None
+    assert results[eid2]["action"] == "resume"
+    assert results[eid2]["from_status"] == "paused"
+    assert results[eid2]["to_status"] == "active"
+    assert results[eid2]["state_version"] == 2
+    assert results[eid2]["reason"] == "review ok"
+
+    assert client.get(f"/experiments/{eid1}").json()["status"] == "paused"
+    detail2 = client.get(f"/experiments/{eid2}").json()
+    assert detail2["status"] == "active"
+    assert detail2["state_version"] == 2
+    # 审计按时间倒序：批量恢复在前，此前的暂停在后
+    events = client.get(f"/experiments/{eid2}/state-events").json()["events"]
+    assert [(e["action"], e["state_version"]) for e in events] == [
+        ("resume", 2),
+        ("pause", 1),
+    ]
+
+    # 恢复后 eid2 揭盲恢复正常
+    ok = client.post(
+        f"/experiments/{eid2}/advance",
+        json={"subject_id": "t0", "expected_period": 1, "request_id": "a1"},
+    )
+    assert ok.status_code == 200
+
+
+def test_state_batch_any_conflict_rolls_back_entire_batch(
+    client: TestClient,
+) -> None:
+    eid1, eid2 = create_two_experiments(client)
+    # eid2 已处于暂停（版本 1），批量中再次暂停必然冲突
+    assert pause_experiment(client, eid2, "pre", "hold").status_code == 200
+
+    resp = state_batch(
+        client,
+        "sb-rollback",
+        [
+            transition_op(eid1, "pause", 0, "rb-1"),
+            transition_op(eid2, "pause", 1, "rb-2"),
+        ],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "batch_operation_rejected"
+    assert detail["batch_operation_id"] == "sb-rollback"
+    assert detail["failures"] == [
+        {
+            "experiment_id": eid2,
+            "operation_id": "rb-2",
+            "reason": "already_paused",
+            "current_status": "paused",
+            "state_version": 1,
+            "expected_version": 1,
+        }
+    ]
+    assert_no_sequence_leak(detail)
+
+    # 整批回滚：eid1 未暂停、版本未变、无审计记录
+    detail1 = client.get(f"/experiments/{eid1}").json()
+    assert detail1["status"] == "active"
+    assert detail1["state_version"] == 0
+    assert client.get(f"/experiments/{eid1}/state-events").json()["events"] == []
+    # eid2 保持暂停，仍只有最初一条审计
+    events2 = client.get(f"/experiments/{eid2}/state-events").json()["events"]
+    assert [e["operation_id"] for e in events2] == ["pre"]
+
+    # 失败不消耗 batch_operation_id：修正操作列表后同键首次成功
+    ok = state_batch(
+        client, "sb-rollback", [transition_op(eid1, "pause", 0, "rb-1")]
+    )
+    assert ok.status_code == 200, ok.text
+    assert client.get(f"/experiments/{eid1}").json()["status"] == "paused"
+
+
+def test_state_batch_version_mismatch_rolls_back(client: TestClient) -> None:
+    eid1, eid2 = create_two_experiments(client)
+
+    resp = state_batch(
+        client,
+        "sb-version",
+        [
+            transition_op(eid1, "pause", 0, "v-1"),
+            transition_op(eid2, "pause", 5, "v-2"),  # 期望版本过期
+        ],
+    )
+    assert resp.status_code == 409
+    (failure,) = resp.json()["detail"]["failures"]
+    assert failure["experiment_id"] == eid2
+    assert failure["operation_id"] == "v-2"
+    assert failure["reason"] == "state_version_mismatch"
+    assert failure["current_status"] == "active"
+    assert failure["state_version"] == 0
+    assert failure["expected_version"] == 5
+
+    # 零写入：两个实验都保持 active / 版本 0
+    for eid in (eid1, eid2):
+        detail = client.get(f"/experiments/{eid}").json()
+        assert detail["status"] == "active"
+        assert detail["state_version"] == 0
+        assert client.get(f"/experiments/{eid}/state-events").json()["events"] == []
+
+
+def test_state_batch_collects_all_failures_in_input_order(
+    client: TestClient,
+) -> None:
+    eid1, _ = create_two_experiments(client)
+
+    resp = state_batch(
+        client,
+        "sb-failures",
+        [
+            transition_op("missing-exp", "pause", 0, "f-1"),
+            transition_op(eid1, "resume", 0, "f-2"),  # 运行中不能恢复
+        ],
+    )
+    assert resp.status_code == 409
+    failures = resp.json()["detail"]["failures"]
+    assert [f["experiment_id"] for f in failures] == ["missing-exp", eid1]
+    assert [f["reason"] for f in failures] == [
+        "experiment_not_found",
+        "already_active",
+    ]
+    assert failures[0] == {
+        "experiment_id": "missing-exp",
+        "operation_id": "f-1",
+        "reason": "experiment_not_found",
+    }
+    assert failures[1]["current_status"] == "active"
+    assert failures[1]["state_version"] == 0
+
+    # 零写入
+    assert client.get(f"/experiments/{eid1}").json()["state_version"] == 0
+    assert client.get(f"/experiments/{eid1}/state-events").json()["events"] == []
+
+
+def test_state_batch_same_batch_operation_id_replays_first_result(
+    client: TestClient,
+) -> None:
+    eid1, eid2 = create_two_experiments(client)
+    operations = [
+        transition_op(eid1, "pause", 0, "idem-op-1", "hold-1"),
+        transition_op(eid2, "pause", 0, "idem-op-2", "hold-2"),
+    ]
+
+    first = state_batch(client, "sb-idem", operations)
+    assert first.status_code == 200
+    first_body = first.json()
+
+    for _ in range(3):
+        replay = state_batch(client, "sb-idem", operations)
+        assert replay.status_code == 200
+        assert replay.json() == first_body
+
+    # 重放不重复递增版本、不重复写审计
+    for eid in (eid1, eid2):
+        assert client.get(f"/experiments/{eid}").json()["state_version"] == 1
+        assert len(client.get(f"/experiments/{eid}/state-events").json()["events"]) == 1
+
+    # 同一 batch_operation_id 绑定不同操作列表 → 409
+    subset = state_batch(client, "sb-idem", operations[:1])
+    assert subset.status_code == 409
+    detail = subset.json()["detail"]
+    assert detail["reason"] == "batch_operation_id_conflict"
+    assert detail["batch_operation_id"] == "sb-idem"
+
+    # 单项字段不同（如期望版本）也视为不同请求
+    changed = [operations[0], transition_op(eid2, "pause", 1, "idem-op-2", "hold-2")]
+    assert state_batch(client, "sb-idem", changed).status_code == 409
+
+    # 冲突路径零写入：状态与审计保持不变
+    for eid in (eid1, eid2):
+        assert client.get(f"/experiments/{eid}").json()["state_version"] == 1
+        assert len(client.get(f"/experiments/{eid}/state-events").json()["events"]) == 1
+
+
+def test_state_batch_item_operation_id_conflict_rolls_back(
+    client: TestClient,
+) -> None:
+    eid1, eid2 = create_two_experiments(client)
+    # 单条暂停已占用 eid1 的 used-op
+    assert pause_experiment(client, eid1, "used-op", "first hold").status_code == 200
+
+    resp = state_batch(
+        client,
+        "sb-opconflict",
+        [
+            transition_op(eid2, "pause", 0, "fresh-op"),
+            # operation_id 已被占用且原因不同 → 冲突
+            transition_op(eid1, "pause", 0, "used-op", "different reason"),
+        ],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["failures"] == [
+        {
+            "experiment_id": eid1,
+            "operation_id": "used-op",
+            "reason": "operation_id_conflict",
+        }
+    ]
+
+    # 整批回滚：eid2 未暂停、无审计
+    detail2 = client.get(f"/experiments/{eid2}").json()
+    assert detail2["status"] == "active"
+    assert detail2["state_version"] == 0
+    assert client.get(f"/experiments/{eid2}/state-events").json()["events"] == []
+
+
+def test_state_batch_replays_matching_existing_operations(
+    client: TestClient,
+) -> None:
+    eid1, eid2 = create_two_experiments(client)
+    paused = pause_experiment(client, eid1, "shared-op", "same reason")
+    assert paused.status_code == 200
+    first_event = paused.json()
+
+    # 新批次引用已存在且参数完全一致的操作：该项按幂等重放，其余项正常执行
+    operations = [
+        transition_op(eid1, "pause", 0, "shared-op", "same reason"),
+        transition_op(eid2, "pause", 0, "new-op"),
+    ]
+    resp = state_batch(client, "sb-replay", operations)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert results[0] == first_event  # 重放首次审计事件，不重复执行
+    assert results[1]["operation_id"] == "new-op"
+    assert results[1]["to_status"] == "paused"
+
+    # 重放项不重复写审计、不重复递增版本；新项正常落库
+    assert client.get(f"/experiments/{eid1}").json()["state_version"] == 1
+    assert len(client.get(f"/experiments/{eid1}/state-events").json()["events"]) == 1
+    assert client.get(f"/experiments/{eid2}").json()["status"] == "paused"
+
+    # 该批次自身也可整体幂等重放
+    replay = state_batch(client, "sb-replay", operations)
+    assert replay.status_code == 200
+    assert replay.json() == resp.json()
+
+
+def test_state_batch_payload_validation(client: TestClient) -> None:
+    eid1, _ = create_two_experiments(client)
+    op = transition_op(eid1, "pause", 0, "v-op")
+
+    # 空操作列表 / 空 batch_operation_id
+    assert state_batch(client, "sb-v", []).status_code == 422
+    assert state_batch(client, "", [op]).status_code == 422
+    # 同一实验在同一批中重复出现
+    assert state_batch(
+        client, "sb-v", [op, transition_op(eid1, "resume", 0, "v-op-2")]
+    ).status_code == 422
+    # 非法动作 / 负版本 / 空 operation_id / 空 reason / 空 experiment_id
+    assert state_batch(
+        client, "sb-v", [transition_op(eid1, "stop", 0, "v-op")]
+    ).status_code == 422
+    assert state_batch(
+        client, "sb-v", [transition_op(eid1, "pause", -1, "v-op")]
+    ).status_code == 422
+    assert state_batch(
+        client, "sb-v", [transition_op(eid1, "pause", 0, "")]
+    ).status_code == 422
+    assert state_batch(
+        client, "sb-v", [transition_op(eid1, "pause", 0, "v-op", "")]
+    ).status_code == 422
+    assert state_batch(
+        client, "sb-v", [transition_op("", "pause", 0, "v-op")]
+    ).status_code == 422
+    # 超过 100 项（校验在入库前发生）
+    too_many = [
+        transition_op(f"e{i}", "pause", 0, f"v-op-{i}") for i in range(101)
+    ]
+    assert state_batch(client, "sb-v", too_many).status_code == 422
+
+
+def test_concurrent_state_batches_have_single_winner(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-state-batch.db"))
+    with TestClient(app) as setup:
+        created = [
+            setup.post(
+                "/experiments",
+                json={
+                    "conditions": ["A", "B"],
+                    "subject_ids": [f"s{k}", f"t{k}"],
+                    "seed": 40 + k,
+                },
+            ).json()
+            for k in range(2)
+        ]
+    eids = [c["experiment_id"] for c in created]
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = state_batch(
+                local_client,
+                f"sb-race-{i}",
+                [
+                    transition_op(eid, "pause", 0, f"race-{i}-{k}")
+                    for k, eid in enumerate(eids)
+                ],
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE 串行化：只有一批通过全部校验，其余看到版本已变而 409
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+
+    with TestClient(app) as verify:
+        for eid in eids:
+            detail = verify.get(f"/experiments/{eid}").json()
+            assert detail["status"] == "paused"
+            assert detail["state_version"] == 1
+            events = verify.get(f"/experiments/{eid}/state-events").json()["events"]
+            assert len(events) == 1
+
+
+def test_legacy_database_supports_state_batch_after_migration(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "legacy-state-batch.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    # 模拟旧版本数据库：只有 experiments / assignments 两张表
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-sb", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-sb", "s1", 0, '["A","B"]'),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-sb", "s2", 1, '["B","A"]'),
+        )
+
+    # 启动自动迁移后，批量状态切换在旧库上可用（旧实验按 active / 版本 0）
+    with TestClient(app) as migrated:
+        operations = [transition_op("legacy-sb", "pause", 0, "lg-1", "hold")]
+        resp = state_batch(migrated, "sb-legacy", operations)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"][0]["state_version"] == 1
+        detail = migrated.get("/experiments/legacy-sb").json()
+        assert detail["status"] == "paused"
+        assert detail["state_version"] == 1
+
+        # 幂等重放返回首次结果
+        replay = state_batch(migrated, "sb-legacy", operations)
+        assert replay.status_code == 200
+        assert replay.json() == resp.json()
+
+        # 批量恢复同样可用
+        resumed = state_batch(
+            migrated,
+            "sb-legacy-2",
+            [transition_op("legacy-sb", "resume", 1, "lg-2")],
+        )
+        assert resumed.status_code == 200
+        assert migrated.get("/experiments/legacy-sb").json()["status"] == "active"
